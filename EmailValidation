@@ -1,0 +1,189 @@
+<script runat='server'>
+    Platform.Load('core', '1');
+
+    var sourceDE = "Contact Master"; // Source DE with emails and subscriber keys
+    var targetDE = "logInvalidEmails"; // Target DE for storing invalid emails
+    var debugLogDE = "DebugLogs"; // Data Extension for storing debug logs
+
+    var config = {
+        endpoint: "https://mcp0vmry3pl80dzlgp450h5p5dx0.auth.marketingcloudapis.com/v2/token",
+        clientId: "{clientID}",
+        clientSecret: "1tolwWT2TFuK2MzOs5VOT8sA",
+        bu: Platform.Function.AuthenticatedMemberID(),
+        localDate: DateTime.SystemDateToLocalDate(Now()),
+        mailboxlayerEndpoint: "https://apilayer.net/api/check",
+        mailboxlayerKey: "YOUR_MAILBOXLAYER_ACCESS_KEY"
+    }
+
+    function debugLog(message) {
+        // Logging directly to a DE; ensure you have proper clean-up mechanisms for log data.
+        Platform.Function.InsertData(debugLogDE, ['Timestamp', 'Message'], [DateTime.SystemDateToLocalDate(Now()), message]);
+    }
+
+    function retrieveToken() {
+        try {
+            debugLog("Retrieving token...");
+            return requestToken();
+        } catch(e) {
+            debugLog("Error during token retrieval: " + e.message);
+            throw e; // Re-throw to handle it in the calling context
+        }
+    }
+
+    function requestToken() {
+        var payload = {
+            "grant_type": "client_credentials",
+            "client_id": config.clientId,
+            "client_secret": config.clientSecret
+        };
+        var url = config.endpoint;
+        var contentType = "application/json";
+
+        try {
+            var request = HTTP.Post(url, contentType, Stringify(payload));
+            if (request.StatusCode == 200) {
+                var result = Platform.Function.ParseJSON(request.Response[0]);
+                debugLog("Token retrieved successfully.");
+                return {
+                    "token": result.access_token,
+                    "url": "https://mcp0vmry3pl80dzlgp450h5p5dx0.rest.marketingcloudapis.com/address/v1/validateEmail"
+                };
+            } else {
+                debugLog("Failed to retrieve token; HTTP Status: " + request.StatusCode);
+                throw new Error("Failed to retrieve token; HTTP Status: " + request.StatusCode);
+            }
+        } catch (e) {
+            debugLog("Request token exception: " + e.message);
+            throw e;
+        }
+    }
+
+    function verifyEmailAddressWithSFMC(email, subscriberKey, auth) {
+        try {
+            if (!email || typeof email !== 'string' || email.trim().length === 0) {
+                debugLog("Invalid or empty email address for Subscriber Key: " + subscriberKey);
+                return { status: "SKIP", message: "Empty email address." };
+            }
+
+            debugLog("Verifying email address with SFMC: " + email);
+            if (auth.token != null) {
+                var requestUrl = auth.url;
+                var payload = {
+                    "email": email,
+                    "validators": ["SyntaxValidator", "MXValidator", "ListDetectiveValidator"]
+                };
+
+                var req = new Script.Util.HttpRequest(requestUrl);
+                req.emptyContentHandling = 0;
+                req.retries = 2;
+                req.continueOnError = true;
+                req.setHeader("Authorization", "Bearer " + auth.token);
+                req.method = "POST";
+                req.contentType = "application/json";
+                req.encoding = "UTF-8";
+                req.postData = Stringify(payload);
+
+                var res = req.send();
+                var result = Platform.Function.ParseJSON(String(res.content));
+
+                if (result && !result.errorcode) {
+                    if (!result.valid) {
+                        var message = "Blocked by " + result.failedValidation + ": " +
+                                      (result.failedValidation === "ListDetectiveValidator" ? "invalid email address" :
+                                       result.failedValidation === "SyntaxValidator" ? "invalid email syntax" :
+                                       result.failedValidation === "MXValidator" ? "invalid email domain name" : "unknown reason");
+                        return { status: "NOK", message: message };
+                    } else {
+                        return { status: "OK", message: "Email address is valid!" };
+                    }
+                } else {
+                    throw new Error("Could not perform verification. Response: " + Stringify(result));
+                }
+            } else {
+                throw new Error("Authentication token is null.");
+            }
+        } catch(e) {
+            debugLog("Error verifying email with SFMC for Subscriber Key: " + subscriberKey + ", Error: " + e.message);
+            throw e;
+        }
+    }
+
+    function verifyEmailAddressWithMailboxlayer(email) {
+        try {
+            if (!email || typeof email !== 'string' || email.trim().length === 0) {
+                return { status: "SKIP", message: "Empty email address." };
+            }
+
+            var requestUrl = config.mailboxlayerEndpoint + "?access_key=" + config.mailboxlayerKey + "&email=" + email;
+
+            var req = new Script.Util.HttpRequest(requestUrl);
+            req.emptyContentHandling = 0;
+            req.retries = 2;
+            req.continueOnError = true;
+            req.method = "GET";
+
+            var res = req.send();
+            var result = Platform.Function.ParseJSON(String(res.content));
+
+            if (result) {
+                if (!result.format_valid || !result.smtp_check) {
+                    var message = "Invalid email address: " +
+                                  (result.format_valid ? "" : "invalid syntax, ") +
+                                  (result.smtp_check ? "" : "SMTP check failed");
+                    return { status: "NOK", message: message };
+                } else {
+                    return { status: "OK", message: "Email address is valid!" };
+                }
+            } else {
+                throw new Error("Could not perform verification. Response: " + Stringify(result));
+            }
+        } catch(e) {
+            debugLog("Error verifying email with Mailboxlayer: " + e.message);
+            throw e;
+        }
+    }
+
+    function processEmails() {
+        try {
+            var auth = retrieveToken();
+            var dataRows = Platform.Function.LookupRows(sourceDE, 'Marketing_Opt-In', 'Opt-In');
+            var emailFields = ['Primary_Email_Address', 'Alternate_Email_Address', 'eSampling_Email_Address', 'Marketing_Email_Address', 'Network1_Email_Address', 'Network2_Email_Address'];
+            for (var i = 0; i < dataRows.length; i++) {
+                var subscriberKey = dataRows[i].ContactKey;
+                for (var j = 0; j < emailFields.length; j++) {
+                    var emailField = emailFields[j];
+                    var email = dataRows[i][emailField];
+                    
+                    // Verify email with SFMC
+                    var sfmcResult = verifyEmailAddressWithSFMC(email, subscriberKey, auth);
+                    var mailboxlayerResult = verifyEmailAddressWithMailboxlayer(email);
+                    
+                    // Log if either verification fails
+                    if (sfmcResult.status === "NOK" || mailboxlayerResult.status === "NOK") {
+                        var reason = (sfmcResult.status === "NOK" ? sfmcResult.message : "") +
+                                     (mailboxlayerResult.status === "NOK" ? mailboxlayerResult.message : "");
+                        Platform.Function.InsertData(targetDE, ['SubscriberKey', 'Email', 'Reason', 'ErrorID'], [subscriberKey, email, reason, Platform.Function.GUID()]);
+                    } else if (sfmcResult.status === "SKIP" || mailboxlayerResult.status === "SKIP") {
+                        debugLog("Skipped processing for " + emailField + " at Subscriber Key: " + subscriberKey + " due to empty email.");
+                    }
+                }
+            }
+        } catch(error) {
+            debugLog("Error during processing: " + error.toString());
+            Write(Stringify({
+                status: "Error",
+                message: error.toString()
+            }));
+        }
+    }
+
+    try {
+        processEmails();
+    } catch(error) {
+        debugLog("Unhandled error: " + error.message);
+        Write(Stringify({
+            status: "Error",
+            message: error.toString()
+        }));
+    }
+</script>
